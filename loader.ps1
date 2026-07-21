@@ -347,7 +347,11 @@ function Invoke-SfPollTick {
     $r = Invoke-SfGetJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/poll/$([uri]::EscapeDataString($script:RequestId))"
     if ($r -and $r.status) {
       switch ($r.status) {
-        'approved' { if ($r.token) { Complete-SfApproved ([string]$r.token) $P } else { Set-SfStatus 'Approved - waiting for the signed token...' } }
+        'approved' {
+          # Nexus/CastForge return the token as `token`; UDE's worker returns it as `license`.
+          $tok = if ($r.token) { $r.token } elseif ($r.license) { $r.license } else { $null }
+          if ($tok) { Complete-SfApproved ([string]$tok) $P } else { Set-SfStatus 'Approved - waiting for the signed token...' }
+        }
         'rejected' {
           Stop-SfPoll
           $reason = if ($r.rejectedReason) { $r.rejectedReason } else { 'no reason given' }
