@@ -173,18 +173,20 @@ function Get-SfFileHashEncoded([string]$Path, [hashtable]$P) {
 }
 function Get-SfInstallerVerified([string]$Token, [hashtable]$P) {
   if ($P.ManifestKind -eq 'ude-json') {
-    # UDE: /v1/latest JSON feed -> installerUrl + installerSha256. The licence
-    # (verified locally by the app) is the gate; the app stays Free-tier until an
-    # approved token lands in license.json.
+    # UDE: /v1/latest (public) names the installer + its sha256; the file itself is
+    # pulled through the TOKEN-GATED worker proxy /updates/ude/<file> (ude-releases
+    # is private) -- uniform with Nexus/CastForge: the licence is the key, the
+    # Worker is the door.
     $edition = if ($P.Edition) { $P.Edition } else { 'Home' }
     $manUrl  = "https://$($P.LicenseDomain)$($P.ApiPrefix)/latest?edition=$edition&channel=stable&current=0.0.0"
     $m = Invoke-SfGetJson $manUrl
-    $file = if ($m.installerUrl) { [string]$m.installerUrl } else { '' }
     $hash = if ($m.installerSha256) { [string]$m.installerSha256 } else { '' }
-    if (-not $file) { throw "UDE update feed did not name an installer." }
+    $fileName = if ($m.installerUrl) { [System.IO.Path]::GetFileName(([uri][string]$m.installerUrl).AbsolutePath) } else { '' }
+    if (-not $fileName) { throw "UDE update feed did not name an installer." }
     if (-not $hash) { throw "UDE update feed published no sha256 to verify against." }
-    $instPath = Join-Path $env:TEMP 'UDE_Home_Setup.exe'
-    Invoke-WebRequest -Uri $file -OutFile $instPath -UseBasicParsing -TimeoutSec 300
+    $dlUrl    = "https://$($P.LicenseDomain)/updates/ude/$([uri]::EscapeDataString($fileName))"
+    $instPath = Join-Path $env:TEMP $fileName
+    Invoke-SfDownload $dlUrl $instPath @{ Authorization = "Bearer $Token" }
     $calc = Get-SfFileHashEncoded $instPath $P
     if ($calc -ine $hash) {
       try { Remove-Item $instPath -Force -ErrorAction SilentlyContinue } catch {}
