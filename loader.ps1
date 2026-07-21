@@ -316,9 +316,14 @@ function Complete-SfApproved([string]$Token, [hashtable]$P) {
     }
     Set-SfStatus 'Approved. Downloading and verifying the installer...'
     $installer = Get-SfInstallerVerified $Token $P
+    # Write the licence BEFORE running the installer: installers commonly auto-launch
+    # the app when they finish, and the app checks its licence at startup. Writing
+    # license.json first guarantees the app opens PRE-ACTIVATED instead of flashing a
+    # "locked / paste your key" wall because the file landed a beat too late.
+    Set-SfStatus 'Activating this device...'
+    Write-SfLicense $Token $script:Hwid $P
     Set-SfStatus 'Verified. Running the installer...'
     Invoke-SfInstaller $installer $P
-    Write-SfLicense $Token $script:Hwid $P
     Clear-SfRequestState $P.Product
     Set-SfStatus "Done. $($P.DisplayName) is installed and pre-activated."
     [System.Windows.Forms.MessageBox]::Show("$($P.DisplayName) is installed and activated. You can launch it now.", 'Steadfast Loader', 'OK', 'Information') | Out-Null
