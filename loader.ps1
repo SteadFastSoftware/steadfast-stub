@@ -40,6 +40,7 @@ $script:PRODUCTS = [ordered]@{
     DisplayName   = 'Nexus Optimus'
     LicenseDomain = 'nexus-license.steadfastsoftwarellc.com'
     ApiPrefix     = ''
+    ManifestKind  = 'electron-yml'
     FeedManifest  = 'latest.yml'
     HashField     = 'sha512'
     HashEncoding  = 'base64'
@@ -52,12 +53,26 @@ $script:PRODUCTS = [ordered]@{
     DisplayName   = 'CastForge'
     LicenseDomain = 'castforge-license.steadfastsoftwarellc.com'
     ApiPrefix     = ''
+    ManifestKind  = 'electron-yml'
     FeedManifest  = 'latest.yml'
     HashField     = 'sha512'
     HashEncoding  = 'base64'
     LicenseDir    = "$env:APPDATA\CastForge"
     LicenseFile   = 'license.json'
     InstallerArgs = ''
+  }
+  'ude-home' = @{
+    Product       = 'ude-home'
+    DisplayName   = 'Undestructable Update Engine'
+    LicenseDomain = 'ude-license.steadfastsoftwarellc.com'
+    ApiPrefix     = '/v1'
+    ManifestKind  = 'ude-json'
+    Edition       = 'Home'
+    HashField     = 'sha256'
+    HashEncoding  = 'hex'
+    LicenseDir    = "$env:APPDATA\UDE"
+    LicenseFile   = 'license.json'
+    InstallerArgs = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
   }
 }
 $script:PollSeconds    = 4
@@ -157,6 +172,27 @@ function Get-SfFileHashEncoded([string]$Path, [hashtable]$P) {
   return [Convert]::ToBase64String($raw)
 }
 function Get-SfInstallerVerified([string]$Token, [hashtable]$P) {
+  if ($P.ManifestKind -eq 'ude-json') {
+    # UDE: /v1/latest JSON feed -> installerUrl + installerSha256. The licence
+    # (verified locally by the app) is the gate; the app stays Free-tier until an
+    # approved token lands in license.json.
+    $edition = if ($P.Edition) { $P.Edition } else { 'Home' }
+    $manUrl  = "https://$($P.LicenseDomain)$($P.ApiPrefix)/latest?edition=$edition&channel=stable&current=0.0.0"
+    $m = Invoke-SfGetJson $manUrl
+    $file = if ($m.installerUrl) { [string]$m.installerUrl } else { '' }
+    $hash = if ($m.installerSha256) { [string]$m.installerSha256 } else { '' }
+    if (-not $file) { throw "UDE update feed did not name an installer." }
+    if (-not $hash) { throw "UDE update feed published no sha256 to verify against." }
+    $instPath = Join-Path $env:TEMP 'UDE_Home_Setup.exe'
+    Invoke-WebRequest -Uri $file -OutFile $instPath -UseBasicParsing -TimeoutSec 300
+    $calc = Get-SfFileHashEncoded $instPath $P
+    if ($calc -ine $hash) {
+      try { Remove-Item $instPath -Force -ErrorAction SilentlyContinue } catch {}
+      throw "Installer integrity check FAILED (sha256 mismatch). Nothing was run."
+    }
+    return $instPath
+  }
+  # electron-yml (Nexus / CastForge): token-gated /updates feed.
   $base    = "https://$($P.LicenseDomain)/updates/$($P.Product)"
   $headers = @{ Authorization = "Bearer $Token" }
   $manPath = Join-Path $env:TEMP "$($P.Product)-$($P.FeedManifest)"
