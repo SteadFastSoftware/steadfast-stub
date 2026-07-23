@@ -34,6 +34,28 @@ Add-Type -AssemblyName System.Drawing
 # Every entry uses the uniform 'node-os' device id + 'json-file' activation.
 # To add a product: append an entry here once its app conforms to the standard.
 # -----------------------------------------------------------------------------
+# --- SINGLE-INSTANCE GUARD (fixes "two windows pop up": loader had no mutex) ---
+# Only one Steadfast Loader may run. A second launch focuses the existing window
+# and exits instead of stacking a duplicate.
+$__sfCreatedNew = $false
+$script:SfInstanceMutex = New-Object System.Threading.Mutex($true, 'Local\SteadfastLoader_SingleInstance', [ref]$__sfCreatedNew)
+if (-not $__sfCreatedNew) {
+    try {
+        Add-Type -Namespace SfSingleInstance -Name Win -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr FindWindow(string c, string n);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int c);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);
+'@ -ErrorAction SilentlyContinue
+        $__h = [SfSingleInstance.Win]::FindWindow($null, 'Steadfast Loader')
+        if ($__h -ne [System.IntPtr]::Zero) {
+            [void][SfSingleInstance.Win]::ShowWindow($__h, 9)
+            [void][SfSingleInstance.Win]::SetForegroundWindow($__h)
+        }
+    } catch {}
+    exit 0
+}
+# -----------------------------------------------------------------------------
+
 $script:PRODUCTS = [ordered]@{
   'nexus' = @{
     Product       = 'nexus'
@@ -322,11 +344,12 @@ function Complete-SfApproved([string]$Token, [hashtable]$P) {
     # "locked / paste your key" wall because the file landed a beat too late.
     Set-SfStatus 'Activating this device...'
     Write-SfLicense $Token $script:Hwid $P
-    Set-SfStatus 'Verified. Running the installer...'
+    Set-SfStatus "Installing $($P.DisplayName)..."
     Invoke-SfInstaller $installer $P
     Clear-SfRequestState $P.Product
-    Set-SfStatus "Done. $($P.DisplayName) is installed and pre-activated."
-    [System.Windows.Forms.MessageBox]::Show("$($P.DisplayName) is installed and activated. You can launch it now.", 'Steadfast Loader', 'OK', 'Information') | Out-Null
+    # No confirmation popup. The installer launches the app, which opens
+    # pre-activated (license.json was written above). The ONLY dialog the user
+    # should see is the app's own What's New. Just close the loader silently.
     $form.Close()
   } catch {
     Set-SfStatus "Install failed: $($_.Exception.Message)"

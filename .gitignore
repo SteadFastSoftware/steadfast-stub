@@ -1,0 +1,6 @@
+# Steadfast Loader (universal stub)
+# local-only safekeeping, never pushed to remote
+_trash/
+*.bak
+node_modules/
+dist/
