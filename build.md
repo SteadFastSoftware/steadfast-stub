@@ -1,12 +1,19 @@
-# Building the Universal Stub
+# Building the Universal Loader
 
-Standard: `STEADFAST-DEVKIT-STANDARD.md` §6b.3 (universal stub) + §6b.2 (code
+Standard: `STEADFAST-DEVKIT-STANDARD.md` §6b.3 (universal loader) + §6b.2 (code
 signing). Doctrine: D31 (bus carries requests) / D32 (licensing + signing are
-local).
+local) / D37 (forward-thinking — the built artifact must equal the shipped one).
 
-The stub is **one codebase** (`stub.ps1`) built **per product** by rendering a
-small config region from the central `registry.js` + the product's
-`product.config.js`. No product ever forks the stub; only its config differs.
+The public download is **one universal loader** (`loader.ps1` →
+`SteadfastLoader.exe`) that serves **every** product from an in-app dropdown; its
+product catalogue is baked in-file, sourced from the central `registry.js`. There
+is no per-product rendering — one binary covers the whole catalogue.
+
+> **Superseded:** the old per-product `stub.ps1` model (rendered `<product>-setup.exe`)
+> was retired to `_trash` on 2026-07-25 (GAP-32). It was never the artifact anyone
+> downloaded (the Hub serves `SteadfastLoader.exe`), and `build.ps1` used to build
+> that unused client while the shipped loader had no scripted build — the exact
+> divergence GAP-32 flagged. `build.ps1` now builds `loader.ps1` directly.
 
 ## Language choice — PowerShell + PS2EXE (native, tiny, not Electron)
 
@@ -22,48 +29,40 @@ the contract in `README.md` is language-agnostic.
 
 ## Prerequisites
 
-- **node** — reads `registry.js` and `product.config.js` (both CommonJS). Always required.
 - **ps2exe** — `Install-Module ps2exe -Scope CurrentUser`. Required to compile.
 - **signtool.exe** (Windows SDK) + the shared **OV/HSM signing identity** — required for `-Sign`.
 
-## Build a product's stub
+(node is no longer required: the loader carries its catalogue in-file, so there is
+no per-product config to read at build time.)
+
+## Build the loader
 
 ```powershell
-# render + compile (unsigned dev build)
-pwsh ./build.ps1 -Product nexus
+# compile (unsigned dev build)
+pwsh ./build.ps1
 
-# point at the product's product.config.js for stub overrides + cross-check
-pwsh ./build.ps1 -Product nexus -ProductConfig C:\SteadfastSoftware\Nexus_Optimizer\product.config.js
+# release: compile + Authenticode-sign
+pwsh ./build.ps1 -Sign
 
-# release: render + compile + Authenticode-sign
-pwsh ./build.ps1 -Product nexus -Sign
-
-# CI / syntax: render only, no compiler needed
-pwsh ./build.ps1 -Product nexus -SkipCompile
+# CI / syntax: parse only, no compiler needed
+pwsh ./build.ps1 -SkipCompile
 ```
 
-Outputs (in `stub/dist/`):
-- `<product>-stub.ps1` — the rendered, product-configured source.
-- `<product>-setup.exe` — the native, (optionally signed) public download.
+Output (in `dist/`):
+- `SteadfastLoader.exe` — the native, (optionally signed) public download for the
+  whole catalogue. Any previous exe is preserved under `dist/_prev/` (never
+  overwrite-without-backup).
 
-## What the build injects (and from where)
+The build first **syntax-parses** `loader.ps1` (fails on any parse error before it
+compiles), then runs PS2EXE `-noConsole`.
 
-`build.ps1` replaces the `# --- SF-CONFIG-BEGIN --- … # --- SF-CONFIG-END ---`
-region of `stub.ps1` with values resolved by a small node reader:
+## Adding a product to the loader
 
-| Config field | Source | Notes |
-|---|---|---|
-| `Product` | `registry.PRODUCTS[<key>].product` | registry is the source of truth |
-| `DisplayName` | `registry.PRODUCTS[<key>].name` | window title / labels |
-| `LicenseDomain` | `registry.PRODUCTS[<key>].licenseDomain` | `<product>-license.steadfastsoftwarellc.com` |
-| `Platform` / `Arch` | `product.config.stub` (default `win32` / `x64`) | baked HWID inputs |
-| `FeedManifest` / `HashField` | `product.config.stub` (default `latest.yml` / `sha512`) | electron-updater feed; PS2EXE products override |
-| `LicenseDir` / `LicenseFile` | `product.config.stub` (default `%APPDATA%\<DisplayName>` / `license.json`) | where the app reads its license |
-| `InstallerArgs` | `product.config.stub` (default `''`) | e.g. `/S` for silent NSIS |
-
-**Cross-check:** if `product.config.licenseWorker` is set it MUST equal the
-registry `licenseDomain`, or the build fails (no drift — mirrors
-`gate-port-isolation` / `gate-devkit-parity`).
+Because the loader is universal, a new product does **not** get its own build: add
+an entry to the `$script:PRODUCTS` catalogue in `loader.ps1` (values sourced from
+`registry.js`: product key, `licenseDomain`, feed/hash, license dir) and rebuild.
+Keep the catalogue in step with `registry.js` — that is the single source of truth
+for ports, license domains, and releases repos.
 
 ## Signing hook (§6b.2 — the ONE OV/HSM identity)
 
