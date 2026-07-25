@@ -98,7 +98,11 @@ $script:PRODUCTS = [ordered]@{
   }
 }
 $script:PollSeconds    = 4
-$script:PollTimeoutMin = 20
+# Operator approval routinely takes far longer than the old 20-minute cap (a stuck
+# customer was approved at +20 and +35 min, after the loader had already quit
+# polling). Raised to 6h AND paired with relaunch-resume (see Resume-SfPendingForProduct)
+# so a still-pending request is never silently abandoned.
+$script:PollTimeoutMin = 360
 
 # =============================================================================
 # NATIVE: GlobalMemoryStatusEx().ullTotalPhys == Node os.totalmem() (exact match)
@@ -256,6 +260,13 @@ function Save-SfRequestState([string]$ProductKey, [string]$RequestId) {
   [System.IO.File]::WriteAllText((Get-SfRequestStatePath $ProductKey), $rec, (New-Object System.Text.UTF8Encoding($false)))
 }
 function Clear-SfRequestState([string]$ProductKey) { try { Remove-Item (Get-SfRequestStatePath $ProductKey) -Force -ErrorAction SilentlyContinue } catch {} }
+# Read back a saved pending request (the persistence above was previously write-only:
+# the id was saved but nothing ever re-read it, so a relaunch could never resume).
+function Get-SfRequestState([string]$ProductKey) {
+  $p = Get-SfRequestStatePath $ProductKey
+  if (-not (Test-Path $p)) { return $null }
+  try { return (Get-Content -Path $p -Raw | ConvertFrom-Json) } catch { return $null }
+}
 
 # =============================================================================
 # UI  (minimal WinForms - native window, product dropdown + request form)
@@ -325,7 +336,12 @@ $cboProduct.Add_SelectedIndexChanged({
   Stop-SfPoll
   $script:RequestId = $null
   $btnRequest.Enabled = $true
-  Set-SfStatus "Selected $((Get-SfSelectedProduct).DisplayName). Enter your details and request a license."
+  $P = Get-SfSelectedProduct
+  # If this product already has a pending request saved, resume polling it instead
+  # of forcing the user to submit a brand-new one.
+  if (-not (Resume-SfPendingForProduct $P)) {
+    Set-SfStatus "Selected $($P.DisplayName). Enter your details and request a license."
+  }
 })
 
 function Complete-SfApproved([string]$Token, [hashtable]$P) {
@@ -362,7 +378,9 @@ function Invoke-SfPollTick {
   $P = Get-SfSelectedProduct
   if (((Get-Date) - $script:PollStarted).TotalMinutes -ge $script:PollTimeoutMin) {
     Stop-SfPoll
-    Set-SfStatus 'No response yet. Reopen the loader later to resume - your request is saved.'
+    # State is intentionally NOT cleared: reopening the loader (or reselecting this
+    # product) auto-resumes this exact request via Resume-SfPendingForProduct.
+    Set-SfStatus 'Still pending. You can close this - it resumes automatically when you reopen the loader.'
     $btnRequest.Enabled = $true
     return
   }
@@ -385,7 +403,21 @@ function Invoke-SfPollTick {
         default { Set-SfStatus "Waiting for operator approval... (device $($script:Hwid))" }
       }
     }
-  } catch { Set-SfStatus "Still waiting (server unreachable, will retry): $($_.Exception.Message)" }
+  } catch {
+    # A 404 means the request record is genuinely gone (expired past the worker's
+    # retention, or cleared) -- distinguish it from a transient network blip so we
+    # don't poll a dead id forever.
+    $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+    if ($sc -eq 404) {
+      Stop-SfPoll
+      Clear-SfRequestState $P.Product
+      $script:RequestId = $null
+      Set-SfStatus 'Your earlier request expired. Please enter your details and request a license again.'
+      $btnRequest.Enabled = $true
+    } else {
+      Set-SfStatus "Still waiting (server unreachable, will retry): $($_.Exception.Message)"
+    }
+  }
 }
 
 function Start-SfPoll {
@@ -396,6 +428,26 @@ function Start-SfPoll {
   $script:PollTimer.Add_Tick({ Invoke-SfPollTick })
   $script:PollTimer.Start()
   Invoke-SfPollTick
+}
+
+# Resume a still-pending request for a product on launch or when its tab is picked.
+# This closes the loop the persistence layer left open (state was saved but never
+# read back), so an approval that lands after the loader was closed is still
+# collected the next time it opens. Returns $true if a resume was started.
+function Resume-SfPendingForProduct([hashtable]$P) {
+  $st = Get-SfRequestState $P.Product
+  if (-not $st -or -not $st.requestId) { return $false }
+  # Drop a request older than the worker's retention window so we never resume onto
+  # an id the server has already forgotten (a 404 during polling also self-heals it).
+  try {
+    $age = ((Get-Date).ToUniversalTime() - ([datetime]$st.at).ToUniversalTime()).TotalDays
+    if ($age -gt 7) { Clear-SfRequestState $P.Product; return $false }
+  } catch {}
+  $script:RequestId = [string]$st.requestId
+  $btnRequest.Enabled = $false
+  Set-SfStatus "Resuming your pending $($P.DisplayName) request - waiting for operator approval..."
+  Start-SfPoll
+  return $true
 }
 
 $btnRequest.Add_Click({
@@ -428,4 +480,6 @@ $btnRequest.Add_Click({
 })
 
 $form.Add_FormClosed({ Stop-SfPoll })
+# On launch, auto-resume a still-pending request for the initially-selected product.
+[void](Resume-SfPendingForProduct (Get-SfSelectedProduct))
 [void]$form.ShowDialog()
