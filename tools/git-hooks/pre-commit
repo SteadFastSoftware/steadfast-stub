@@ -1,0 +1,26 @@
+#!/bin/sh
+# Steadfast shared-infra pre-commit (drift-proof hooks — GAP-26 uniformity, 2026-07-25).
+# These infra repos do NOT vendor the devkit (no sf.js), so there is no `sf audit` here;
+# the commit-message ceremony is enforced by tools/git-hooks/commit-msg (the canonical
+# single source of truth). This hook keeps Gate 0 so a commit never lands on a detached
+# HEAD, plus a light syntax tooth on staged JS. core.hooksPath = tools/git-hooks (relative,
+# in-tree) makes the tracked hook the LIVE hook — it cannot drift (D18 / F35).
+set -e
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 1
+cd "$ROOT" || exit 1
+
+# ----- Gate 0: DETACHED-HEAD GUARD -------------------------------------------
+if [ -z "$(git symbolic-ref --quiet HEAD 2>/dev/null)" ]; then
+  echo "[pre-commit] FAIL: HEAD is detached. Your commit would land on a loose pointer."
+  echo "[pre-commit] Fix: git branch -f main HEAD && git checkout main"
+  exit 1
+fi
+
+# ----- Gate 1: light syntax tooth (node --check staged .js; no-op if none) ----
+if command -v node >/dev/null 2>&1; then
+  for f in $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.js$' || true); do
+    [ -f "$f" ] || continue
+    node --check "$f" || { echo "[pre-commit] FAIL: node --check $f"; exit 1; }
+  done
+fi
+exit 0

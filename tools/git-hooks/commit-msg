@@ -1,0 +1,5 @@
+#!/bin/sh
+# Steadfast commit-message ceremony - delegates to the canonical devkit hook.
+# GAP-20 message-rule unification (2026-07-23). Single source of truth:
+# steadfast-devkit/core/hooks/commit-msg -- do not fork commit rules here.
+exec sh "/c/SteadfastSoftware/steadfast-devkit/core/hooks/commit-msg" "$@"
