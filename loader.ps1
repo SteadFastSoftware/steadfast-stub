@@ -100,7 +100,7 @@ $script:PRODUCTS = [ordered]@{
 $script:PollSeconds    = 4
 # Operator approval routinely takes far longer than the old 20-minute cap (a stuck
 # customer was approved at +20 and +35 min, after the loader had already quit
-# polling). Raised to 6h AND paired with relaunch-resume (see Resume-SfPendingForProduct)
+# polling). Raised to 6h AND paired with relaunch-resume (see Resume-SfAllPending)
 # so a still-pending request is never silently abandoned.
 $script:PollTimeoutMin = 360
 
@@ -271,14 +271,20 @@ function Get-SfRequestState([string]$ProductKey) {
 # =============================================================================
 # UI  (minimal WinForms - native window, product dropdown + request form)
 # =============================================================================
+# Multi-product state. Instead of a single $script:RequestId we now track a
+# per-product job record so 1-3 products can be requested / polled / activated in
+# ONE run. Keyed by product key (same keys as $script:PRODUCTS). Each job is:
+#   @{ Product; DisplayName; Name; RequestId; Status; Message; P }
+# Status is one of: pending | approved | denied | activated | error
 $script:Hwid        = Get-SfHwid
-$script:RequestId   = $null
+$script:Jobs        = @{}
+$script:ProductKeys = @($script:PRODUCTS.Keys)
 $script:PollTimer   = $null
 $script:PollStarted = $null
 
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = 'Steadfast Loader'
-$form.Size            = New-Object System.Drawing.Size(470, 400)
+$form.Size            = New-Object System.Drawing.Size(470, 545)
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox     = $false
@@ -296,127 +302,193 @@ function New-SfText($x, $y, $w) {
 
 $form.Controls.Add((New-SfLabel 'Steadfast Software - request a product license' 20 14 430))
 
-$form.Controls.Add((New-SfLabel 'Product' 20 46 120))
-$cboProduct = New-Object System.Windows.Forms.ComboBox
-$cboProduct.Location = New-Object System.Drawing.Point(20, 66)
-$cboProduct.Size = New-Object System.Drawing.Size(410, 24)
-$cboProduct.DropDownStyle = 'DropDownList'
-foreach ($k in $script:PRODUCTS.Keys) { [void]$cboProduct.Items.Add($script:PRODUCTS[$k].DisplayName) }
-$cboProduct.SelectedIndex = 0
-$form.Controls.Add($cboProduct)
+$form.Controls.Add((New-SfLabel 'Products (check 1-3)' 20 46 300))
+# Multi-select: one checkbox per product in $script:PRODUCTS. The user may check
+# 1, 2, or all 3. Index order matches $script:ProductKeys so a checked index maps
+# straight back to a product key.
+$clbProducts = New-Object System.Windows.Forms.CheckedListBox
+$clbProducts.Location = New-Object System.Drawing.Point(20, 66)
+$clbProducts.Size = New-Object System.Drawing.Size(410, 70)
+$clbProducts.CheckOnClick = $true
+$clbProducts.IntegralHeight = $false
+foreach ($k in $script:ProductKeys) { [void]$clbProducts.Items.Add($script:PRODUCTS[$k].DisplayName) }
+$form.Controls.Add($clbProducts)
 
-$form.Controls.Add((New-SfLabel 'Name'  20 98  120));  $txtName    = New-SfText 20 118 410; $form.Controls.Add($txtName)
-$form.Controls.Add((New-SfLabel 'Email' 20 148 120));  $txtEmail   = New-SfText 20 168 410; $form.Controls.Add($txtEmail)
-$form.Controls.Add((New-SfLabel 'Company (optional)' 20 198 200)); $txtCompany = New-SfText 20 218 410; $form.Controls.Add($txtCompany)
+$form.Controls.Add((New-SfLabel 'Name'  20 142 120)); $txtName    = New-SfText 20 162 410; $form.Controls.Add($txtName)
+$form.Controls.Add((New-SfLabel 'Email' 20 190 120)); $txtEmail   = New-SfText 20 210 410; $form.Controls.Add($txtEmail)
+$form.Controls.Add((New-SfLabel 'Company (optional)' 20 238 200)); $txtCompany = New-SfText 20 258 410; $form.Controls.Add($txtCompany)
 
-$lblHwid = New-SfLabel "Device ID: $($script:Hwid)" 20 248 430
+$lblHwid = New-SfLabel "Device ID: $($script:Hwid)" 20 286 430
 $form.Controls.Add($lblHwid)
 
 $btnRequest = New-Object System.Windows.Forms.Button
 $btnRequest.Text = 'Request license'
-$btnRequest.Location = New-Object System.Drawing.Point(20, 274)
+$btnRequest.Location = New-Object System.Drawing.Point(20, 312)
 $btnRequest.Size = New-Object System.Drawing.Size(410, 32)
 $form.Controls.Add($btnRequest)
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(20, 316)
-$lblStatus.Size = New-Object System.Drawing.Size(410, 44)
-$lblStatus.Text = 'Pick your product, enter your details, and request a license. Approval releases the download.'
+$lblStatus.Location = New-Object System.Drawing.Point(20, 352)
+$lblStatus.Size = New-Object System.Drawing.Size(410, 40)
+$lblStatus.Text = 'Check the products you want, enter your details, and request licenses. Approval releases each download.'
 $form.Controls.Add($lblStatus)
 
+# Per-product status list so the user sees, e.g.,
+#   Nexus Optimus: waiting for approval
+#   CastForge: installed / activated
+#   Undestructable Update Engine: declined: ...
+$txtProductStatus = New-Object System.Windows.Forms.TextBox
+$txtProductStatus.Location = New-Object System.Drawing.Point(20, 396)
+$txtProductStatus.Size = New-Object System.Drawing.Size(410, 92)
+$txtProductStatus.Multiline = $true
+$txtProductStatus.ReadOnly = $true
+$txtProductStatus.ScrollBars = 'Vertical'
+$txtProductStatus.BackColor = [System.Drawing.SystemColors]::Window
+$form.Controls.Add($txtProductStatus)
+
 function Set-SfStatus([string]$msg) { $lblStatus.Text = $msg; $lblStatus.Refresh() }
-function Get-SfSelectedProduct {
-  $keys = @($script:PRODUCTS.Keys)
-  return $script:PRODUCTS[$keys[$cboProduct.SelectedIndex]]
+
+# Products the user has currently checked, as an array of product config hashtables.
+function Get-SfCheckedProducts {
+  $sel = @()
+  foreach ($i in $clbProducts.CheckedIndices) { $sel += $script:PRODUCTS[$script:ProductKeys[$i]] }
+  return $sel
 }
+
+# Count of jobs still needing the poll loop (pending, or approved-but-not-yet-installed).
+function Get-SfActiveJobCount {
+  $n = 0
+  foreach ($k in $script:ProductKeys) {
+    if ($script:Jobs.Contains($k)) {
+      $s = $script:Jobs[$k].Status
+      if ($s -eq 'pending' -or $s -eq 'approved') { $n++ }
+    }
+  }
+  return $n
+}
+
+# Rebuild the per-product status panel from $script:Jobs (in catalogue order).
+function Set-SfProductStatusUi {
+  $lines = @()
+  foreach ($k in $script:ProductKeys) {
+    if ($script:Jobs.Contains($k)) {
+      $j = $script:Jobs[$k]
+      $human = switch ($j.Status) {
+        'pending'   { 'waiting for approval' }
+        'approved'  { 'approved - installing' }
+        'activated' { 'installed / activated' }
+        'denied'    { "declined: $($j.Message)" }
+        'error'     { "error: $($j.Message)" }
+        default     { [string]$j.Status }
+      }
+      $lines += "$($j.DisplayName): $human"
+    }
+  }
+  $txtProductStatus.Text = ($lines -join [Environment]::NewLine)
+  $txtProductStatus.Refresh()
+}
+
 function Stop-SfPoll { if ($script:PollTimer) { $script:PollTimer.Stop(); $script:PollTimer.Dispose(); $script:PollTimer = $null } }
 
-# switching product cancels any in-flight poll and re-enables the form
-$cboProduct.Add_SelectedIndexChanged({
-  Stop-SfPoll
-  $script:RequestId = $null
-  $btnRequest.Enabled = $true
-  $P = Get-SfSelectedProduct
-  # If this product already has a pending request saved, resume polling it instead
-  # of forcing the user to submit a brand-new one.
-  if (-not (Resume-SfPendingForProduct $P)) {
-    Set-SfStatus "Selected $($P.DisplayName). Enter your details and request a license."
-  }
-})
-
-function Complete-SfApproved([string]$Token, [hashtable]$P) {
-  Stop-SfPoll
-  $btnRequest.Enabled = $false
+# Download / verify / activate a SINGLE approved product independently of the others.
+# Unlike the old single-product flow this NEVER closes the form (other products may
+# still be pending); it just marks that product's job 'activated' (or 'error') and
+# lets the poll loop keep going for the rest.
+function Complete-SfApprovedJob([hashtable]$Job, [string]$Token) {
+  $P = $Job.P
+  $Job.Status = 'approved'; $Job.Message = 'installing'
+  Set-SfProductStatusUi
   try {
     if (-not (Test-SfTokenBinding $Token $script:Hwid $P.Product)) {
-      Set-SfStatus 'The approved license does not match this device/product. Contact support.'
+      $Job.Status = 'error'; $Job.Message = 'license does not match this device/product'
+      Set-SfProductStatusUi
       return
     }
-    Set-SfStatus 'Approved. Downloading and verifying the installer...'
+    Set-SfStatus "Approved: $($P.DisplayName). Downloading and verifying the installer..."
     $installer = Get-SfInstallerVerified $Token $P
     # Write the licence BEFORE running the installer: installers commonly auto-launch
     # the app when they finish, and the app checks its licence at startup. Writing
     # license.json first guarantees the app opens PRE-ACTIVATED instead of flashing a
     # "locked / paste your key" wall because the file landed a beat too late.
-    Set-SfStatus 'Activating this device...'
+    Set-SfStatus "Activating $($P.DisplayName) on this device..."
     Write-SfLicense $Token $script:Hwid $P
     Set-SfStatus "Installing $($P.DisplayName)..."
     Invoke-SfInstaller $installer $P
     Clear-SfRequestState $P.Product
-    # No confirmation popup. The installer launches the app, which opens
-    # pre-activated (license.json was written above). The ONLY dialog the user
-    # should see is the app's own What's New. Just close the loader silently.
-    $form.Close()
+    $Job.Status = 'activated'; $Job.Message = ''
   } catch {
-    Set-SfStatus "Install failed: $($_.Exception.Message)"
-    $btnRequest.Enabled = $true
+    $Job.Status = 'error'; $Job.Message = $_.Exception.Message
   }
+  Set-SfProductStatusUi
 }
 
+# One poll cycle: poll EVERY still-active product (pending or approved-awaiting-token)
+# and update its job independently. One product's failure never aborts the batch.
 function Invoke-SfPollTick {
-  if (-not $script:RequestId) { Stop-SfPoll; return }
-  $P = Get-SfSelectedProduct
+  # Snapshot the products that still need work this cycle.
+  $active = @()
+  foreach ($k in $script:ProductKeys) {
+    if ($script:Jobs.Contains($k)) {
+      $s = $script:Jobs[$k].Status
+      if ($s -eq 'pending' -or $s -eq 'approved') { $active += $k }
+    }
+  }
+  if ($active.Count -eq 0) { Stop-SfPoll; return }
+
   if (((Get-Date) - $script:PollStarted).TotalMinutes -ge $script:PollTimeoutMin) {
     Stop-SfPoll
-    # State is intentionally NOT cleared: reopening the loader (or reselecting this
-    # product) auto-resumes this exact request via Resume-SfPendingForProduct.
+    # Pending state is intentionally NOT cleared: reopening the loader auto-resumes
+    # every still-pending request via Resume-SfAllPending.
     Set-SfStatus 'Still pending. You can close this - it resumes automatically when you reopen the loader.'
-    $btnRequest.Enabled = $true
+    $btnRequest.Enabled = $true; $clbProducts.Enabled = $true
     return
   }
-  try {
-    $r = Invoke-SfGetJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/poll/$([uri]::EscapeDataString($script:RequestId))"
-    if ($r -and $r.status) {
-      switch ($r.status) {
-        'approved' {
-          # Nexus/CastForge return the token as `token`; UDE's worker returns it as `license`.
-          $tok = if ($r.token) { $r.token } elseif ($r.license) { $r.license } else { $null }
-          if ($tok) { Complete-SfApproved ([string]$tok) $P } else { Set-SfStatus 'Approved - waiting for the signed token...' }
+
+  foreach ($k in $active) {
+    $j = $script:Jobs[$k]
+    if (-not $j.RequestId) { continue }
+    $P = $j.P
+    try {
+      $r = Invoke-SfGetJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/poll/$([uri]::EscapeDataString($j.RequestId))"
+      if ($r -and $r.status) {
+        switch ($r.status) {
+          'approved' {
+            # Nexus/CastForge return the token as `token`; UDE's worker returns it as `license`.
+            $tok = if ($r.token) { $r.token } elseif ($r.license) { $r.license } else { $null }
+            if ($tok) { Complete-SfApprovedJob $j ([string]$tok) }
+            else { $j.Status = 'approved'; $j.Message = 'waiting for signed token' }
+          }
+          'rejected' {
+            $reason = if ($r.rejectedReason) { $r.rejectedReason } else { 'no reason given' }
+            $j.Status = 'denied'; $j.Message = $reason
+            Clear-SfRequestState $P.Product
+          }
+          default { $j.Status = 'pending'; $j.Message = '' }
         }
-        'rejected' {
-          Stop-SfPoll
-          $reason = if ($r.rejectedReason) { $r.rejectedReason } else { 'no reason given' }
-          Set-SfStatus "Request declined: $reason. Nothing was downloaded."
-          Clear-SfRequestState $P.Product
-          $btnRequest.Enabled = $true
-        }
-        default { Set-SfStatus "Waiting for operator approval... (device $($script:Hwid))" }
+      }
+    } catch {
+      # A 404 means THIS request record is genuinely gone (expired past the worker's
+      # retention, or cleared) -- distinguish it from a transient network blip so we
+      # don't poll a dead id forever. Self-heal only this product; others continue.
+      $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+      if ($sc -eq 404) {
+        Clear-SfRequestState $P.Product
+        $j.RequestId = $null
+        $j.Status = 'error'; $j.Message = 'earlier request expired - please request again'
+      } else {
+        # transient: leave the job pending and retry next tick
       }
     }
-  } catch {
-    # A 404 means the request record is genuinely gone (expired past the worker's
-    # retention, or cleared) -- distinguish it from a transient network blip so we
-    # don't poll a dead id forever.
-    $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
-    if ($sc -eq 404) {
-      Stop-SfPoll
-      Clear-SfRequestState $P.Product
-      $script:RequestId = $null
-      Set-SfStatus 'Your earlier request expired. Please enter your details and request a license again.'
-      $btnRequest.Enabled = $true
-    } else {
-      Set-SfStatus "Still waiting (server unreachable, will retry): $($_.Exception.Message)"
-    }
+  }
+
+  Set-SfProductStatusUi
+  $stillActive = Get-SfActiveJobCount
+  if ($stillActive -eq 0) {
+    Stop-SfPoll
+    $btnRequest.Enabled = $true; $clbProducts.Enabled = $true
+    Set-SfStatus 'All requests resolved. See per-product status below.'
+  } else {
+    Set-SfStatus "Waiting for operator approval... ($stillActive still pending, device $($script:Hwid))"
   }
 }
 
@@ -430,56 +502,81 @@ function Start-SfPoll {
   Invoke-SfPollTick
 }
 
-# Resume a still-pending request for a product on launch or when its tab is picked.
-# This closes the loop the persistence layer left open (state was saved but never
-# read back), so an approval that lands after the loader was closed is still
-# collected the next time it opens. Returns $true if a resume was started.
-function Resume-SfPendingForProduct([hashtable]$P) {
-  $st = Get-SfRequestState $P.Product
-  if (-not $st -or -not $st.requestId) { return $false }
-  # Drop a request older than the worker's retention window so we never resume onto
-  # an id the server has already forgotten (a 404 during polling also self-heals it).
-  try {
-    $age = ((Get-Date).ToUniversalTime() - ([datetime]$st.at).ToUniversalTime()).TotalDays
-    if ($age -gt 7) { Clear-SfRequestState $P.Product; return $false }
-  } catch {}
-  $script:RequestId = [string]$st.requestId
-  $btnRequest.Enabled = $false
-  Set-SfStatus "Resuming your pending $($P.DisplayName) request - waiting for operator approval..."
-  Start-SfPoll
-  return $true
+# Resume EVERY still-pending request found in %TEMP% on launch (the persistence
+# layer is already per-product). This closes the loop the persistence left open
+# (state was saved but never read back), so approvals that land after the loader was
+# closed are collected the next time it opens -- for all products at once. Rebuilds
+# the multi-product job table from the per-product saved records and checks each
+# resumed product in the list so the UI reflects it. Returns $true if any resumed.
+function Resume-SfAllPending {
+  $resumed = $false
+  for ($i = 0; $i -lt $script:ProductKeys.Count; $i++) {
+    $key = $script:ProductKeys[$i]
+    $P = $script:PRODUCTS[$key]
+    $st = Get-SfRequestState $P.Product
+    if (-not $st -or -not $st.requestId) { continue }
+    # Drop a request older than the worker's retention window so we never resume onto
+    # an id the server has already forgotten (a 404 during polling also self-heals it).
+    try {
+      $age = ((Get-Date).ToUniversalTime() - ([datetime]$st.at).ToUniversalTime()).TotalDays
+      if ($age -gt 7) { Clear-SfRequestState $P.Product; continue }
+    } catch {}
+    $script:Jobs[$key] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = ''; RequestId = [string]$st.requestId; Status = 'pending'; Message = ''; P = $P }
+    $clbProducts.SetItemChecked($i, $true)
+    $resumed = $true
+  }
+  if ($resumed) {
+    $btnRequest.Enabled = $false; $clbProducts.Enabled = $false
+    Set-SfProductStatusUi
+    Set-SfStatus 'Resuming your pending request(s) - waiting for operator approval...'
+    Start-SfPoll
+  }
+  return $resumed
 }
 
 $btnRequest.Add_Click({
-  $P = Get-SfSelectedProduct
+  $sel   = Get-SfCheckedProducts
   $name  = $txtName.Text.Trim()
   $email = $txtEmail.Text.Trim()
+  if ($sel.Count -lt 1) { Set-SfStatus 'Please check at least one product.'; return }
   if (-not $name -or -not $email) { Set-SfStatus 'Please enter your name and email.'; return }
   if ($email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { Set-SfStatus 'Please enter a valid email.'; return }
   $btnRequest.Enabled = $false
-  $cboProduct.Enabled = $false
-  Set-SfStatus "Sending $($P.DisplayName) request..."
-  try {
-    $body = @{ name = $name; email = $email; hwid = $script:Hwid; product = $P.Product; appVersion = 'loader' }
-    if ($txtCompany.Text.Trim()) { $body.company = $txtCompany.Text.Trim() }
-    $resp = Invoke-SfPostJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/request" $body
-    if ($resp -and $resp.requestId) {
-      $script:RequestId = [string]$resp.requestId
-      Save-SfRequestState $P.Product $script:RequestId
-      Set-SfStatus 'Request sent. Waiting for operator approval...'
-      Start-SfPoll
-    } else {
-      $err = if ($resp -and $resp.error) { $resp.error } else { 'unknown error' }
-      Set-SfStatus "Request failed: $err"
-      $btnRequest.Enabled = $true; $cboProduct.Enabled = $true
+  $clbProducts.Enabled = $false
+  $company = $txtCompany.Text.Trim()
+  # POST one /request per checked product. Record each result as a job; a failure on
+  # one product is recorded and we continue with the rest (never abort the batch).
+  $anySent = $false
+  foreach ($P in $sel) {
+    Set-SfStatus "Sending $($P.DisplayName) request..."
+    try {
+      $body = @{ name = $name; email = $email; hwid = $script:Hwid; product = $P.Product; appVersion = 'loader' }
+      if ($company) { $body.company = $company }
+      $resp = Invoke-SfPostJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/request" $body
+      if ($resp -and $resp.requestId) {
+        $rid = [string]$resp.requestId
+        Save-SfRequestState $P.Product $rid
+        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $rid; Status = 'pending'; Message = ''; P = $P }
+        $anySent = $true
+      } else {
+        $err = if ($resp -and $resp.error) { $resp.error } else { 'unknown error' }
+        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'error'; Message = $err; P = $P }
+      }
+    } catch {
+      $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'error'; Message = $_.Exception.Message; P = $P }
     }
-  } catch {
-    Set-SfStatus "Could not reach the license server: $($_.Exception.Message)"
-    $btnRequest.Enabled = $true; $cboProduct.Enabled = $true
+  }
+  Set-SfProductStatusUi
+  if ($anySent) {
+    Set-SfStatus 'Request(s) sent. Waiting for operator approval...'
+    Start-SfPoll
+  } else {
+    Set-SfStatus 'No requests could be sent. See per-product status below.'
+    $btnRequest.Enabled = $true; $clbProducts.Enabled = $true
   }
 })
 
 $form.Add_FormClosed({ Stop-SfPoll })
-# On launch, auto-resume a still-pending request for the initially-selected product.
-[void](Resume-SfPendingForProduct (Get-SfSelectedProduct))
+# On launch, auto-resume ALL still-pending requests found in %TEMP% (per-product).
+[void](Resume-SfAllPending)
 [void]$form.ShowDialog()
