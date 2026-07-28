@@ -268,6 +268,22 @@ function Get-SfRequestState([string]$ProductKey) {
   try { return (Get-Content -Path $p -Raw | ConvertFrom-Json) } catch { return $null }
 }
 
+# DEVICE-KEYED lookup: ask the worker "is THIS device already approved for this product?"
+# Returns the token/license if approved, else $null. This is what lets the loader
+# recognize an already-approved device and skip requesting/waiting entirely, and makes
+# an operator's approval reach the device no matter which request it approved.
+function Get-SfApprovedKeyForDevice([hashtable]$P) {
+  try {
+    $r = Invoke-SfGetJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/device/$([uri]::EscapeDataString($script:Hwid))"
+    if ($r -and $r.status -eq 'approved') {
+      $tok = if ($r.token) { $r.token } elseif ($r.license) { $r.license } else { $null }
+      if ($tok) { return [string]$tok }
+    }
+  } catch { }
+  return $null
+}
+
+
 # =============================================================================
 # UI  (minimal WinForms - native window, product dropdown + request form)
 # =============================================================================
@@ -446,38 +462,15 @@ function Invoke-SfPollTick {
 
   foreach ($k in $active) {
     $j = $script:Jobs[$k]
-    if (-not $j.RequestId) { continue }
     $P = $j.P
     try {
-      $r = Invoke-SfGetJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/poll/$([uri]::EscapeDataString($j.RequestId))"
-      if ($r -and $r.status) {
-        switch ($r.status) {
-          'approved' {
-            # Nexus/CastForge return the token as `token`; UDE's worker returns it as `license`.
-            $tok = if ($r.token) { $r.token } elseif ($r.license) { $r.license } else { $null }
-            if ($tok) { Complete-SfApprovedJob $j ([string]$tok) }
-            else { $j.Status = 'approved'; $j.Message = 'waiting for signed token' }
-          }
-          'rejected' {
-            $reason = if ($r.rejectedReason) { $r.rejectedReason } else { 'no reason given' }
-            $j.Status = 'denied'; $j.Message = $reason
-            Clear-SfRequestState $P.Product
-          }
-          default { $j.Status = 'pending'; $j.Message = '' }
-        }
-      }
+      # DEVICE-KEYED poll: is THIS device approved for the product now? Authoritative --
+      # one request's rejection or a stale id must NEVER declare the product declined.
+      $tok = Get-SfApprovedKeyForDevice $P
+      if ($tok) { Complete-SfApprovedJob $j $tok }
+      else { $j.Status = 'pending'; $j.Message = '' }
     } catch {
-      # A 404 means THIS request record is genuinely gone (expired past the worker's
-      # retention, or cleared) -- distinguish it from a transient network blip so we
-      # don't poll a dead id forever. Self-heal only this product; others continue.
-      $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
-      if ($sc -eq 404) {
-        Clear-SfRequestState $P.Product
-        $j.RequestId = $null
-        $j.Status = 'error'; $j.Message = 'earlier request expired - please request again'
-      } else {
-        # transient: leave the job pending and retry next tick
-      }
+      # transient network blip -- leave pending, retry next tick
     }
   }
 
@@ -514,14 +507,14 @@ function Resume-SfAllPending {
     $key = $script:ProductKeys[$i]
     $P = $script:PRODUCTS[$key]
     $st = Get-SfRequestState $P.Product
-    if (-not $st -or -not $st.requestId) { continue }
+    if (-not $st) { continue }
     # Drop a request older than the worker's retention window so we never resume onto
     # an id the server has already forgotten (a 404 during polling also self-heals it).
     try {
       $age = ((Get-Date).ToUniversalTime() - ([datetime]$st.at).ToUniversalTime()).TotalDays
       if ($age -gt 7) { Clear-SfRequestState $P.Product; continue }
-    } catch {}
-    $script:Jobs[$key] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = ''; RequestId = [string]$st.requestId; Status = 'pending'; Message = ''; P = $P }
+    } catch { Clear-SfRequestState $P.Product; continue }
+    $script:Jobs[$key] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = ''; RequestId = $null; Status = 'pending'; Message = ''; P = $P }
     $clbProducts.SetItemChecked($i, $true)
     $resumed = $true
   }
@@ -548,24 +541,53 @@ $btnRequest.Add_Click({
   # one product is recorded and we continue with the rest (never abort the batch).
   $anySent = $false
   foreach ($P in $sel) {
+    # DEVICE-FIRST: already approved for this device? activate now, never request.
+    $existing = Get-SfApprovedKeyForDevice $P
+    if ($existing) {
+      $job = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'approved'; Message = ''; P = $P }
+      $script:Jobs[$P.Product] = $job
+      Complete-SfApprovedJob $job $existing
+      $anySent = $true
+      continue
+    }
+    # DE-DUPE: already have a pending request saved for this device+product? don't mint a duplicate.
+    if (Get-SfRequestState $P.Product) {
+      $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'pending'; Message = ''; P = $P }
+      $anySent = $true
+      continue
+    }
     Set-SfStatus "Sending $($P.DisplayName) request..."
     try {
       $body = @{ name = $name; email = $email; hwid = $script:Hwid; product = $P.Product; appVersion = 'loader' }
       if ($company) { $body.company = $company }
       $resp = Invoke-SfPostJson "https://$($P.LicenseDomain)$($P.ApiPrefix)/request" $body
       if ($resp -and $resp.requestId) {
-        $rid = [string]$resp.requestId
-        Save-SfRequestState $P.Product $rid
-        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $rid; Status = 'pending'; Message = ''; P = $P }
+        Save-SfRequestState $P.Product ([string]$resp.requestId)
+        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = [string]$resp.requestId; Status = 'pending'; Message = ''; P = $P }
         $anySent = $true
       } else {
         $err = if ($resp -and $resp.error) { $resp.error } else { 'unknown error' }
-        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'error'; Message = $err; P = $P }
+        # rate_limited just means mid-cooldown / already pending -- treat as pending, poll by device.
+        if ($err -match 'rate') {
+          Save-SfRequestState $P.Product ''
+          $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'pending'; Message = ''; P = $P }
+          $anySent = $true
+        } else {
+          $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'error'; Message = $err; P = $P }
+        }
       }
     } catch {
-      $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'error'; Message = $_.Exception.Message; P = $P }
+      $msg = $_.Exception.Message
+      if ($msg -match '429|rate') {
+        Save-SfRequestState $P.Product ''
+        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'pending'; Message = ''; P = $P }
+        $anySent = $true
+      } else {
+        $script:Jobs[$P.Product] = @{ Product = $P.Product; DisplayName = $P.DisplayName; Name = $name; RequestId = $null; Status = 'error'; Message = $msg; P = $P }
+      }
     }
   }
+
   Set-SfProductStatusUi
   if ($anySent) {
     Set-SfStatus 'Request(s) sent. Waiting for operator approval...'
