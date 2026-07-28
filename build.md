@@ -56,6 +56,37 @@ Output (in `dist/`):
 The build first **syntax-parses** `loader.ps1` (fails on any parse error before it
 compiles), then runs PS2EXE `-noConsole`.
 
+## Publish + self-update (GAP-43 / GAP-44)
+
+The loader **updates itself** so a tester never has to be re-sent a new binary.
+On launch it reads its embedded `$script:LoaderVersion`, asks the public ungated
+feed (`$LoaderFeed` → `steadfast-loader-feed` worker) for `latest.json`, and if a
+newer version exists it downloads `SteadfastLoader.exe`, verifies the published
+`sha256`, swaps its own exe in place (a detached `powershell.exe` swapper waits
+for this process to exit, retries `Move-Item`, then relaunches) and continues.
+Any failure is silent — it just runs the current exe and writes a one-line
+breadcrumb to `%TEMP%\sf-selfupdate.log`.
+
+```powershell
+# build, hash, write latest.json, and push exe+manifest to the PRIVATE feed repo
+pwsh ./build.ps1 -Publish
+```
+
+- **Version is single-sourced** from `$script:LoaderVersion` in `loader.ps1` —
+  bump it, then `-Publish`. That is what tags the release (`vX.Y.Z`) and the
+  `latest.json` version.
+- **Feed = `steadfast-loader-feed` worker** (`steadfast-stub/worker/`) proxying the
+  **private** `SteadFastSoftware/steadfast-stub-releases` repo with a server-side
+  `GH_RELEASE_TOKEN` (read-only, single-repo). The loader carries **no secret**
+  (D32); the feed is asset-allowlisted + fail-closed + per-IP rate-limited and
+  serves ONLY `latest.json` + `SteadfastLoader.exe`.
+- **PS2EXE runspace caveat (GAP-44):** the compiled exe's session does **not**
+  include every cmdlet — `Get-FileHash` is missing and throws `CommandNotFound`.
+  Self-update code therefore hashes via `[System.Security.Cryptography.SHA256]`,
+  copies via `[System.IO.File]::Copy`, and does detached work via `powershell.exe`
+  (a `cmd`/`.bat` swapper would not launch reliably). **Always prove self-update
+  against the ACTUAL compiled exe, never source alone** (D08).
+
 ## Adding a product to the loader
 
 Because the loader is universal, a new product does **not** get its own build: add
