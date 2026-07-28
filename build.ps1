@@ -132,6 +132,24 @@ if ($Publish) {
   if ($LASTEXITCODE -ne 0) { Fail "gh publish failed." }
   $names = & gh release view $tag --repo $repo --json assets --jq '[.assets[].name]'
   Info "published assets: $names"
+
+  # ALSO publish to the PUBLIC steadfast-stub repo (GAP-45). Its
+  # `releases/latest/download/SteadfastLoader.exe` link is the one shared with
+  # testers DIRECTLY for the FIRST download; the private feed above is only the
+  # self-update source. Publish to BOTH every time or the shared public link goes
+  # stale (testers downloaded a week-old loader because only the feed was updated).
+  $pubRepo = 'SteadFastSoftware/steadfast-stub'
+  $pubTag = "loader-v$version"
+  $pubExists = & gh release view $pubTag --repo $pubRepo 2>$null
+  if ($pubExists) {
+    Info "public release $pubTag exists -- refreshing asset (--clobber)"
+    & gh release upload $pubTag $exePath --repo $pubRepo --clobber
+  } else {
+    Info "creating public release $pubTag (marked latest)"
+    & gh release create $pubTag $exePath --repo $pubRepo --title "Steadfast Loader v$version" --notes "Universal Steadfast Loader v$version -- device-keyed activation + self-update. Download once; it keeps itself up to date." --latest
+  }
+  if ($LASTEXITCODE -ne 0) { Fail "public gh publish failed." }
+  Info "public first-download link now serves v$version (releases/latest on steadfast-stub)"
 }
 
 Info "done: $exePath"
