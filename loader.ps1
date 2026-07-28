@@ -104,6 +104,19 @@ $script:PollSeconds    = 4
 # so a still-pending request is never silently abandoned.
 $script:PollTimeoutMin = 360
 
+# -----------------------------------------------------------------------------
+# SELF-UPDATE (so a tester never has to be re-sent a fresh loader by hand).
+# On launch the loader asks its PUBLIC, ungated feed whether a newer build of
+# ITSELF exists; if so it downloads it, verifies the published sha256, swaps the
+# running exe in place and relaunches. Any failure is silent -- it just runs the
+# current loader (never bricks a tester). The feed exposes ONLY the loader
+# manifest + binary; it carries no secret (the GitHub read token lives on the
+# worker). $LoaderVersion is the single source of version truth: build.ps1
+# -Publish reads it to tag the release + write latest.json.
+# -----------------------------------------------------------------------------
+$script:LoaderVersion = '1.0.0'
+$script:LoaderFeed    = 'https://steadfast-loader-feed.castforge.workers.dev'
+
 # =============================================================================
 # NATIVE: GlobalMemoryStatusEx().ullTotalPhys == Node os.totalmem() (exact match)
 # =============================================================================
@@ -252,6 +265,61 @@ function Write-SfLicense([string]$Token, [string]$Hwid, [hashtable]$P) {
   $path = Join-Path $dir $P.LicenseFile
   [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
+
+# =============================================================================
+# SELF-UPDATE: check the feed for a newer loader, verify its hash, swap + relaunch.
+# =============================================================================
+function ConvertTo-SfVersion([string]$v) {
+  try { return [version]($v -replace '^[vV]', '') } catch { return $null }
+}
+function Invoke-SfSelfUpdate {
+  try {
+    # Only the COMPILED loader may self-swap. In dev (running loader.ps1 under
+    # pwsh) the host exe is pwsh.exe -- never touch it.
+    $selfExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if (-not $selfExe -or ([System.IO.Path]::GetFileName($selfExe) -ne 'SteadfastLoader.exe')) { return }
+
+    $man = Invoke-SfGetJson "$($script:LoaderFeed)/loader/latest"
+    if (-not $man -or -not $man.version) { return }
+    $latest = ConvertTo-SfVersion ([string]$man.version)
+    $cur    = ConvertTo-SfVersion $script:LoaderVersion
+    if (-not $latest -or -not $cur -or $latest -le $cur) { return }   # already current
+
+    $sha = if ($man.sha256) { [string]$man.sha256 } else { '' }
+    if (-not $sha) { return }   # refuse to swap without an integrity value
+
+    $tmp = Join-Path $env:TEMP ("SteadfastLoader-" + ([string]$man.version) + ".exe")
+    Invoke-SfDownload "$($script:LoaderFeed)/loader/download/SteadfastLoader.exe" $tmp @{}
+    $calc = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash
+    if ($calc -ine $sha) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return }  # integrity fail -> keep current
+
+    # Stage the verified new exe beside the running one, then hand off to a tiny
+    # swapper: a running .exe is locked, so the swapper waits for THIS process to
+    # exit, moves the new file over the original, and relaunches it. If the move
+    # can't happen (e.g. no write permission), nothing is lost -- the old exe
+    # stays and keeps working.
+    $newPath = "$selfExe.new"
+    Copy-Item $tmp $newPath -Force
+    $bat = Join-Path $env:TEMP 'sf-loader-swap.cmd'
+    $lines = @(
+      '@echo off',
+      'set "TGT=' + $selfExe + '"',
+      'set "NEW=' + $newPath + '"',
+      ':wait',
+      'ping -n 2 127.0.0.1 >nul',
+      'move /y "%NEW%" "%TGT%" >nul 2>&1 || goto wait',
+      'start "" "%TGT%"'
+    )
+    Set-Content -Path $bat -Value $lines -Encoding ASCII
+    # Release the single-instance mutex so the relaunched loader can acquire it.
+    try { $script:SfInstanceMutex.ReleaseMutex() } catch {}
+    Start-Process cmd -ArgumentList '/c', "`"$bat`"" -WindowStyle Hidden
+    exit 0
+  } catch { }   # any failure -> silently continue with the current loader
+}
+# Run the check up front, before any UI is built (avoids flashing a window we are
+# about to relaunch). Guarded + fail-safe: a bad network or feed never blocks use.
+Invoke-SfSelfUpdate
 
 # request-id persistence (per product) so a relaunch resumes a pending request
 function Get-SfRequestStatePath([string]$ProductKey) { Join-Path $env:TEMP "$ProductKey-loader-request.json" }

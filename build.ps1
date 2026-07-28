@@ -30,7 +30,8 @@
 param(
   [string]$OutDir,          # default: <script dir>\dist
   [switch]$Sign,
-  [switch]$SkipCompile
+  [switch]$SkipCompile,
+  [switch]$Publish          # after building: hash, write latest.json, push exe+manifest to the PRIVATE releases repo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -89,6 +90,48 @@ if ($Sign) {
   Info "signed + verified."
 } else {
   Info "unsigned build. Re-run with -Sign for a release artifact (gate-code-signing blocks unsigned releases)."
+}
+
+# --- 4. Publish the loader + manifest to the PRIVATE releases feed -----------
+# The loader self-update feed (steadfast-loader-feed worker) serves whatever is
+# on the latest release of steadfast-stub-releases. Version is read from the ONE
+# source of truth: $script:LoaderVersion in loader.ps1. We refuse to publish an
+# unsigned build unless -Sign was ALSO passed OR the caller explicitly accepts it
+# (gate-code-signing blocks unsigned RELEASES; a beta loader may ship unsigned
+# until the signing identity is wired, matching the deferred-signing posture).
+if ($Publish) {
+  $repo = 'SteadFastSoftware/steadfast-stub-releases'
+  $verMatch = [regex]::Match((Get-Content $src -Raw), "LoaderVersion\s*=\s*'([^']+)'")
+  if (-not $verMatch.Success) { Fail "could not read `$script:LoaderVersion from loader.ps1" }
+  $version = $verMatch.Groups[1].Value
+  if (-not (Test-Path $exePath)) { Fail "nothing to publish: $exePath not built (drop -SkipCompile)" }
+
+  $sha = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash.ToLower()
+  $manifest = [ordered]@{
+    version     = $version
+    sha256      = $sha
+    asset       = 'SteadfastLoader.exe'
+    signed      = [bool]$Sign
+    publishedAt = (Get-Date).ToUniversalTime().ToString('o')
+  }
+  $manPath = Join-Path $OutDir 'latest.json'
+  ($manifest | ConvertTo-Json) | Set-Content -Path $manPath -Encoding utf8
+  Info "manifest -> $manPath (version $version, sha256 $($sha.Substring(0,12))...)"
+
+  if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail "gh CLI not found - cannot publish." }
+  # Use whatever auth gh already holds (GH_TOKEN env or keyring). Do NOT clear it.
+  $tag = "v$version"
+  $exists = & gh release view $tag --repo $repo 2>$null
+  if ($exists) {
+    Info "release $tag exists -- refreshing assets (--clobber)"
+    & gh release upload $tag $exePath $manPath --repo $repo --clobber
+  } else {
+    Info "creating release $tag"
+    & gh release create $tag $exePath $manPath --repo $repo --title "Steadfast Loader $tag" --notes "Universal Steadfast Loader $tag"
+  }
+  if ($LASTEXITCODE -ne 0) { Fail "gh publish failed." }
+  $names = & gh release view $tag --repo $repo --json assets --jq '[.assets[].name]'
+  Info "published assets: $names"
 }
 
 Info "done: $exePath"

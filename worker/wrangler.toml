@@ -1,0 +1,26 @@
+name = "steadfast-loader-feed"
+main = "worker.js"
+compatibility_date = "2024-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Pin the deploy target to the Steadfast Software LLC Cloudflare account so a
+# deploy never lands on whatever account the shell token happens to hold
+# (uniform with the product workers).
+account_id = "b711450a377e11c48a284747d8116810"
+
+# The loader feed is INTENTIONALLY reachable on workers.dev: it is the ungated
+# pre-license entry point (a person runs the loader before they have any token),
+# so unlike the product license workers it does not hide behind a custom domain.
+# It exposes only the loader manifest + binary (asset-allowlisted, fail-closed).
+workers_dev = true
+
+# KV for the per-IP rate limit + best-effort hit counters. Create once with:
+#   wrangler kv namespace create LOADER_KV
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "LOADER_KV"
+id = "5ccd5a77cd114b0e8d9c58023ae1c325"
+
+# GH_RELEASE_TOKEN (read-only fine-grained PAT scoped to the PRIVATE
+# steadfast-stub-releases repo) is set via `wrangler secret put GH_RELEASE_TOKEN`,
+# NEVER in this file. It lives only in the Cloudflare encrypted store (D32/D34).

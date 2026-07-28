@@ -1,0 +1,7 @@
+{
+  "name": "steadfast-loader-feed",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ungated public feed that serves the Steadfast Loader manifest + binary for self-update (proxies the private steadfast-stub-releases repo)."
+}
