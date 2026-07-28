@@ -114,7 +114,7 @@ $script:PollTimeoutMin = 360
 # worker). $LoaderVersion is the single source of version truth: build.ps1
 # -Publish reads it to tag the release + write latest.json.
 # -----------------------------------------------------------------------------
-$script:LoaderVersion = '1.0.0'
+$script:LoaderVersion = '1.0.5'
 $script:LoaderFeed    = 'https://steadfast-loader-feed.castforge.workers.dev'
 
 # =============================================================================
@@ -290,32 +290,35 @@ function Invoke-SfSelfUpdate {
 
     $tmp = Join-Path $env:TEMP ("SteadfastLoader-" + ([string]$man.version) + ".exe")
     Invoke-SfDownload "$($script:LoaderFeed)/loader/download/SteadfastLoader.exe" $tmp @{}
-    $calc = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash
-    if ($calc -ine $sha) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return }  # integrity fail -> keep current
+    # Hash via .NET, NOT Get-FileHash: the PS2EXE runspace does not include the
+    # Get-FileHash cmdlet, so it throws CommandNotFound and self-update silently
+    # aborts. The .NET SHA256 path is the same one used for the device id.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try { $calcBytes = $sha256.ComputeHash([System.IO.File]::ReadAllBytes($tmp)) } finally { $sha256.Dispose() }
+    $calc = -join ($calcBytes | ForEach-Object { $_.ToString('x2') })
+    if ($calc -ine $sha) { try { [System.IO.File]::Delete($tmp) } catch { }; return }  # integrity fail -> keep current
 
-    # Stage the verified new exe beside the running one, then hand off to a tiny
-    # swapper: a running .exe is locked, so the swapper waits for THIS process to
-    # exit, moves the new file over the original, and relaunches it. If the move
-    # can't happen (e.g. no write permission), nothing is lost -- the old exe
+    # Stage the verified new exe beside the running one, then hand off to a
+    # detached PowerShell swapper: a running .exe is locked, so it waits for THIS
+    # process to exit, retries Move-Item over the original until it succeeds, and
+    # relaunches it. (A cmd/.bat swapper proved unreliable to launch detached;
+    # powershell.exe is on every Windows box and launches cleanly.) If the move
+    # can never happen (e.g. no write permission), nothing is lost -- the old exe
     # stays and keeps working.
     $newPath = "$selfExe.new"
-    Copy-Item $tmp $newPath -Force
-    $bat = Join-Path $env:TEMP 'sf-loader-swap.cmd'
-    $lines = @(
-      '@echo off',
-      'set "TGT=' + $selfExe + '"',
-      'set "NEW=' + $newPath + '"',
-      ':wait',
-      'ping -n 2 127.0.0.1 >nul',
-      'move /y "%NEW%" "%TGT%" >nul 2>&1 || goto wait',
-      'start "" "%TGT%"'
-    )
-    Set-Content -Path $bat -Value $lines -Encoding ASCII
+    [System.IO.File]::Copy($tmp, $newPath, $true)   # .NET copy (avoid cmdlet gaps in the PS2EXE runspace)
+    $se = $selfExe.Replace("'", "''")
+    $np = $newPath.Replace("'", "''")
+    $swap = "Start-Sleep -Seconds 2; for(`$i=0;`$i -lt 40;`$i++){ try{ Move-Item -LiteralPath '$np' -Destination '$se' -Force; break }catch{ Start-Sleep -Milliseconds 500 } }; Start-Process -FilePath '$se'"
     # Release the single-instance mutex so the relaunched loader can acquire it.
     try { $script:SfInstanceMutex.ReleaseMutex() } catch {}
-    Start-Process cmd -ArgumentList '/c', "`"$bat`"" -WindowStyle Hidden
+    Start-Process powershell -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-Command', $swap -WindowStyle Hidden
     exit 0
-  } catch { }   # any failure -> silently continue with the current loader
+  } catch {
+    # Any failure -> silently continue with the current loader. A one-line breadcrumb
+    # is written so a self-update problem is diagnosable without bricking anyone.
+    try { ("{0} self-update: {1}: {2}" -f [DateTime]::Now.ToString('o'), $_.Exception.GetType().Name, $_.Exception.Message) | Out-File "$env:TEMP\sf-selfupdate.log" -Append -Encoding utf8 } catch { }
+  }
 }
 # Run the check up front, before any UI is built (avoids flashing a window we are
 # about to relaunch). Guarded + fail-safe: a bad network or feed never blocks use.
