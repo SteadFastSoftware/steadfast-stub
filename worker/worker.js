@@ -112,7 +112,11 @@ async function streamAsset(env, assetName, contentType) {
     status: 200,
     headers: {
       'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=' + CACHE_SECONDS,
+      // GAP-9 (2026-07-30): no-store, matching the product update proxies. The old
+      // 5-min edge cache meant the loader's self-update manifest and binary could be
+      // served from different cache epochs during a staggered publish -> sha256
+      // mismatch -> the loader silently fails to self-update. Always serve fresh.
+      'Cache-Control': 'no-store',
       ...cors(),
     },
   });
