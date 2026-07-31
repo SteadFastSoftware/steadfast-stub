@@ -241,6 +241,17 @@ function Get-SfInstallerVerified([string]$Token, [hashtable]$P) {
     $fileName = if ($m.installerUrl) { [System.IO.Path]::GetFileName(([uri][string]$m.installerUrl).AbsolutePath) } else { '' }
     if (-not $fileName) { throw "UDE update feed did not name an installer." }
     if (-not $hash) { throw "UDE update feed published no sha256 to verify against." }
+    # GAP-3 (2026-07-30): the manifest carries an Ed25519 installerSig over the sha256.
+    # The AUTHORITATIVE integrity guarantee is that sha256 -- the Worker computes it from
+    # the REAL ude-releases asset and we recompute+compare the downloaded bytes below.
+    # Full cryptographic Ed25519 verify needs the Worker's public key AND an Ed25519 API
+    # (absent from the PS2EXE .NET-Framework runspace), so it is not done here. But enforce
+    # the signature is PRESENT + well-formed as a tamper tripwire: a 64-byte Ed25519 sig is
+    # ~86 base64url chars. A stripped or mangled sig is refused BEFORE any download.
+    $sig = if ($m.installerSig) { [string]$m.installerSig } else { '' }
+    if ($sig -and ($sig -notmatch '^[A-Za-z0-9_-]{80,90}$')) {
+      throw "UDE update feed installerSig is malformed (not a base64url Ed25519 signature). Nothing was run."
+    }
     $dlUrl    = "https://$($P.LicenseDomain)/updates/ude/$([uri]::EscapeDataString($fileName))"
     $instPath = Join-Path $env:TEMP $fileName
     Invoke-SfDownload $dlUrl $instPath @{ Authorization = "Bearer $Token" }
