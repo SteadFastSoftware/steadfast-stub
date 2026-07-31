@@ -207,7 +207,13 @@ function Test-SfTokenBinding([string]$Token, [string]$Hwid, [string]$ProductKey)
     $machine = if ($payload.machine) { $payload.machine } elseif ($payload.hwid) { $payload.hwid } else { $null }
     if ($machine -and (($machine.ToString().ToUpper()) -ne $Hwid)) { return $false }
     return $true
-  } catch { return $true }
+  } catch {
+    # GAP-8 (2026-07-30): FAIL-CLOSED. A legit (or legacy) token has a valid base64url
+    # JSON payload that never throws here; only a malformed/garbage token reaches this
+    # catch, so returning $false rejects exactly the bad ones. The worker 401 remains
+    # the authority, but the loader no longer waves a broken token through.
+    return $false
+  }
 }
 
 # =============================================================================
