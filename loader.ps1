@@ -177,7 +177,19 @@ function Invoke-SfPostJson([string]$Url, [hashtable]$Body) {
 }
 function Invoke-SfGetJson([string]$Url) { return Invoke-RestMethod -Uri $Url -Method Get -TimeoutSec 20 }
 function Invoke-SfDownload([string]$Url, [string]$OutFile, [hashtable]$Headers) {
-  Invoke-WebRequest -Uri $Url -Headers $Headers -OutFile $OutFile -UseBasicParsing -TimeoutSec 120
+  # GAP-10 (2026-07-30): bounded retry with backoff so a transient network blip does
+  # not fail the install outright. The downstream sha256/sha512 check still catches a
+  # truncated/partial file, so a retry can never install corrupt bytes.
+  $attempts = 3
+  for ($i = 1; $i -le $attempts; $i++) {
+    try {
+      Invoke-WebRequest -Uri $Url -Headers $Headers -OutFile $OutFile -UseBasicParsing -TimeoutSec 120
+      return
+    } catch {
+      if ($i -eq $attempts) { throw }
+      Start-Sleep -Seconds ([int][Math]::Min(8, [Math]::Pow(2, $i)))
+    }
+  }
 }
 function ConvertFrom-SfBase64Url([string]$s) {
   $s = $s.Replace('-', '+').Replace('_', '/')
