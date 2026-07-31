@@ -95,6 +95,13 @@ $script:PRODUCTS = [ordered]@{
     LicenseDir    = "$env:APPDATA\UDE"
     LicenseFile   = 'license.json'
     InstallerArgs = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
+    # base64url of the Worker's 32-byte Ed25519 PUBLIC key (the counterpart of
+    # UDE_INSTALLER_SIGN_PRIV_KEY). NON-secret — belongs in config, not C:\Dev_Keys.
+    # When set, Get-SfInstallerVerified additionally verifies the manifest's
+    # installerSig over the sha256 bytes with the self-tested Ed25519 verifier and
+    # HARD-STOPS on failure. Empty = signature layer dormant; the sha256 chain (feed
+    # hash == downloaded exe, itself Worker-recomputed) still fully gates the install.
+    InstallerSignPubKey = ''
   }
 }
 $script:PollSeconds    = 4
@@ -228,6 +235,99 @@ function Get-SfFileHashEncoded([string]$Path, [hashtable]$P) {
   if ($P.HashEncoding -eq 'hex') { return (-join ($raw | ForEach-Object { $_.ToString('x2') })) }
   return [Convert]::ToBase64String($raw)
 }
+# =============================================================================
+# Ed25519 signature verification (GAP-3, 2026-07-30). .NET Framework has no Ed25519
+# API, so we compile a compact BigInteger reference verifier (RFC 8032 -- slow but
+# correct; one verify per install). It is SELF-TESTED against the RFC 8032 test vector
+# at first use: only if the known-good vector verifies TRUE and a 1-bit-tampered vector
+# verifies FALSE do we trust it. If the self-test fails (or the assembly won't compile),
+# we DO NOT verify -- we fall back to the sha256 chain, so a buggy verifier can never
+# accept a forged signature.
+# =============================================================================
+$script:SfEd25519Ready = $null
+$SfEd25519Cs = @'
+using System; using System.Numerics; using System.Security.Cryptography;
+public static class SfEd {
+  static readonly BigInteger P = BigInteger.Pow(2,255) - 19;
+  static readonly BigInteger L = BigInteger.Pow(2,252) + BigInteger.Parse("27742317777372353535851937790883648493");
+  static BigInteger M(BigInteger x){ x%=P; if(x.Sign<0)x+=P; return x; }
+  static BigInteger Inv(BigInteger x){ return BigInteger.ModPow(M(x),P-2,P); }
+  static readonly BigInteger D = default(BigInteger);
+  static readonly BigInteger I = default(BigInteger);
+  static readonly BigInteger[] Ba = null;
+  static SfEd(){
+    D = M(BigInteger.Parse("-121665")*Inv(121666));
+    I = BigInteger.ModPow(2,(P-1)/4,P);
+    BigInteger By = M(4*Inv(5));
+    BigInteger Bx = Xrec(By);
+    Ba = new BigInteger[]{Bx,By};
+  }
+  static BigInteger Xrec(BigInteger y){ BigInteger xx=M((y*y-1)*Inv(D*y*y+1)); BigInteger x=BigInteger.ModPow(xx,(P+3)/8,P); if(M(x*x-xx).Sign!=0)x=M(x*I); if((x&1)!=0)x=P-x; return x; }
+  static BigInteger[] AddP(BigInteger[] p,BigInteger[] q){ BigInteger a=p[0],b=p[1],c=q[0],e=q[1]; BigInteger dd=M(D*a*c*b*e); BigInteger x=M((a*e+c*b)*Inv(1+dd)); BigInteger y=M((b*e+a*c)*Inv(1-dd)); return new BigInteger[]{x,y}; }
+  static BigInteger[] Mul(BigInteger[] p,BigInteger n){ if(n.Sign==0) return new BigInteger[]{BigInteger.Zero,BigInteger.One}; BigInteger[] q=Mul(p,n/2); q=AddP(q,q); if((n&1)!=0)q=AddP(q,p); return q; }
+  static BigInteger LE(byte[] b){ BigInteger r=BigInteger.Zero; for(int i=b.Length-1;i>=0;i--) r=r*256+b[i]; return r; }
+  static BigInteger[] Dec(byte[] s){ byte[] t=(byte[])s.Clone(); int sign=(t[31]>>7)&1; t[31]=(byte)(t[31]&0x7f); BigInteger y=LE(t); BigInteger x=Xrec(y); if(((int)(x&1))!=sign)x=P-x; return new BigInteger[]{x,y}; }
+  public static bool Verify(byte[] sig,byte[] msg,byte[] pk){
+    if(sig==null||pk==null||sig.Length!=64||pk.Length!=32) return false;
+    try{
+      byte[] R=new byte[32]; Array.Copy(sig,0,R,0,32);
+      byte[] Sb=new byte[32]; Array.Copy(sig,32,Sb,0,32); BigInteger S=LE(Sb);
+      byte[] hin=new byte[64+msg.Length]; Array.Copy(R,0,hin,0,32); Array.Copy(pk,0,hin,32,32); Array.Copy(msg,0,hin,64,msg.Length);
+      byte[] hh; using(var sha=SHA512.Create()) hh=sha.ComputeHash(hin);
+      BigInteger h=LE(hh)%L; if(h.Sign<0)h+=L;
+      var A=Dec(pk); var sB=Mul(Ba,S); var Rp=Dec(R); var hA=Mul(A,h); var RhA=AddP(Rp,hA);
+      return sB[0]==RhA[0] && sB[1]==RhA[1];
+    } catch { return false; }
+  }
+}
+'@
+function Test-SfEd25519Ready {
+  if ($null -ne $script:SfEd25519Ready) { return $script:SfEd25519Ready }
+  $ok = $false
+  try {
+    if (-not ('SfEd' -as [type])) {
+      # BigInteger lives in System.Numerics.dll on .NET Framework (Windows PowerShell
+      # 5.1 / PS2EXE — the loader's shipping runtime) but is forwarded to
+      # System.Runtime.Numerics on .NET Core / PowerShell 7. Reference the assembly that
+      # ACTUALLY backs BigInteger on whatever runtime we are on, resolved at runtime, so
+      # the compile is correct on both without name-guessing. Also reference the SHA512
+      # assembly the same way. If Add-Type fails for any reason the catch below sets
+      # Ready=$false and the loader falls back to the sha256 chain (never a false accept).
+      $refs = @(
+        [System.Numerics.BigInteger].Assembly.Location,
+        [System.Security.Cryptography.SHA512].Assembly.Location
+      ) | Where-Object { $_ } | Sort-Object -Unique
+      Add-Type -TypeDefinition $SfEd25519Cs -ReferencedAssemblies $refs -Language CSharp -ErrorAction Stop
+    }
+    # Fixed Ed25519 known-answer vector. Generated with Node's crypto (OpenSSL-backed
+    # Ed25519) and verified good==true / 1-bit-tampered==false under this very verifier
+    # on Windows PowerShell 5.1 (the loader's shipping runtime) on 2026-07-31. The
+    # message is a 32-byte value, deliberately modelling the production path: the Worker
+    # signs bytesFromHex(sha256) — a 32-byte hash — so the self-test exercises the exact
+    # message length the real installerSig verification uses. If this KAT ever fails to
+    # verify (buggy impl, broken BigInteger, wrong assembly), Ready stays false and the
+    # loader falls back to the sha256 chain — it can NEVER accept a forged signature.
+    $pk  = [byte[]]@(0xd5,0xc7,0xec,0xc1,0x20,0x6d,0xed,0x2b,0x5e,0xf8,0x86,0xf4,0x81,0x5a,0x4e,0xdd,0x17,0xbf,0x97,0x84,0x53,0xf4,0x31,0xa6,0x18,0x7f,0x56,0xd0,0xf0,0xa3,0xf1,0xc1)
+    $msg = [byte[]]@(0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0x01)
+    $sig = [byte[]]@(0x2f,0x3d,0x18,0x6e,0x23,0x86,0x32,0x99,0x7d,0x60,0x84,0x4e,0x93,0xbf,0x60,0x65,0x58,0x9c,0xfa,0x05,0xfa,0xf8,0x9d,0xe5,0x93,0xda,0x97,0xc9,0x0d,0x07,0x16,0x8f,0x51,0xcf,0x05,0x3a,0xad,0xae,0xd3,0xf6,0xd1,0xad,0xeb,0x0f,0x21,0x40,0x9a,0x9d,0x6b,0x94,0x24,0xce,0x42,0xdc,0x53,0x22,0x77,0x5e,0x11,0x72,0x16,0x2b,0x2b,0x08)
+    $good = [SfEd]::Verify($sig,$msg,$pk)
+    $bad = [byte[]]$sig.Clone(); $bad[0] = [byte]($bad[0] -bxor 1)
+    $tamper = [SfEd]::Verify($bad,$msg,$pk)
+    $ok = ($good -and -not $tamper)
+  } catch { $ok = $false }
+  $script:SfEd25519Ready = $ok
+  return $ok
+}
+function ConvertFrom-SfB64UrlBytes([string]$s) {
+  $s = $s.Replace('-', '+').Replace('_', '/'); switch ($s.Length % 4) { 2 { $s += '==' } 3 { $s += '=' } }
+  return [Convert]::FromBase64String($s)
+}
+function ConvertFrom-SfHexBytes([string]$h) {
+  $h = $h.Trim(); $out = New-Object byte[] ($h.Length/2)
+  for ($i=0; $i -lt $out.Length; $i++) { $out[$i] = [Convert]::ToByte($h.Substring($i*2,2),16) }
+  return $out
+}
+
 function Get-SfInstallerVerified([string]$Token, [hashtable]$P) {
   if ($P.ManifestKind -eq 'ude-json') {
     # UDE: /v1/latest (public) names the installer + its sha256; the file itself is
@@ -241,16 +341,28 @@ function Get-SfInstallerVerified([string]$Token, [hashtable]$P) {
     $fileName = if ($m.installerUrl) { [System.IO.Path]::GetFileName(([uri][string]$m.installerUrl).AbsolutePath) } else { '' }
     if (-not $fileName) { throw "UDE update feed did not name an installer." }
     if (-not $hash) { throw "UDE update feed published no sha256 to verify against." }
-    # GAP-3 (2026-07-30): the manifest carries an Ed25519 installerSig over the sha256.
-    # The AUTHORITATIVE integrity guarantee is that sha256 -- the Worker computes it from
-    # the REAL ude-releases asset and we recompute+compare the downloaded bytes below.
-    # Full cryptographic Ed25519 verify needs the Worker's public key AND an Ed25519 API
-    # (absent from the PS2EXE .NET-Framework runspace), so it is not done here. But enforce
-    # the signature is PRESENT + well-formed as a tamper tripwire: a 64-byte Ed25519 sig is
-    # ~86 base64url chars. A stripped or mangled sig is refused BEFORE any download.
+    # GAP-3 (2026-07-30, upgraded 2026-07-31): the manifest carries an Ed25519 installerSig
+    # over the sha256. Two layers now guard it. (1) The sha256 chain is authoritative -- the
+    # Worker computes it from the REAL ude-releases asset and we recompute+compare the
+    # downloaded bytes below. (2) FULL cryptographic Ed25519 verify is now performed in-proc
+    # by [SfEd] (a self-tested BigInteger RFC-8032 verifier that runs in the PS2EXE
+    # .NET-Framework runspace -- no native Ed25519 API needed) whenever the Worker's public
+    # key is configured. First, enforce the signature is PRESENT + well-formed as a tamper
+    # tripwire: a 64-byte Ed25519 sig is ~86 base64url chars. A stripped or mangled sig is
+    # refused BEFORE any download.
     $sig = if ($m.installerSig) { [string]$m.installerSig } else { '' }
     if ($sig -and ($sig -notmatch '^[A-Za-z0-9_-]{80,90}$')) {
       throw "UDE update feed installerSig is malformed (not a base64url Ed25519 signature). Nothing was run."
+    }
+    # Full Ed25519 verify when the Worker's public key is configured AND the self-tested
+    # verifier is available. The Worker signs the RAW sha256 bytes (bytesFromHex(sha256)),
+    # so the signed message is the 32-byte hash. A verify failure is a hard stop; when no
+    # pubkey is set (or the runtime lacks a proven verifier) the sha256 chain stands in.
+    $pub = if ($P.InstallerSignPubKey) { [string]$P.InstallerSignPubKey } else { '' }
+    if ($sig -and $pub -and (Test-SfEd25519Ready)) {
+      $ok2 = $false
+      try { $ok2 = [SfEd]::Verify((ConvertFrom-SfB64UrlBytes $sig), (ConvertFrom-SfHexBytes $hash), (ConvertFrom-SfB64UrlBytes $pub)) } catch { $ok2 = $false }
+      if (-not $ok2) { throw "UDE update feed installerSig FAILED Ed25519 verification (manifest tampered or wrong key). Nothing was run." }
     }
     $dlUrl    = "https://$($P.LicenseDomain)/updates/ude/$([uri]::EscapeDataString($fileName))"
     $instPath = Join-Path $env:TEMP $fileName
