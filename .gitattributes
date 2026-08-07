@@ -1,0 +1,29 @@
+# Steadfast canonical line-ending policy — SINGLE SOURCE OF TRUTH.
+# Root-fix 2026-08-06 (GAP-79): made uniform across ALL repos + the sf-init template,
+# from the proven CastForge FEATURE-laptop-perfect policy (2026-04-26). Every repo
+# carries an identical copy of this file (vendored from here) and was renormalized once
+# (`git add --renormalize`). Enforced by gate-line-endings.
+#
+# WHY: without a policy, files show as phantom-"modified" across machines because
+# autocrlf converts endings differently per checkout (the SMOKEY<->SMOKESTACK churn,
+# GAP-10). With this, all text is LF in the working tree everywhere, so the two
+# machines agree byte-for-byte. Code moves between machines via git remotes, never by
+# Syncthing copying the .git folder (see .stignore + TETHER-CONTINUITY.md).
+
+# All text files: LF in the working tree on every OS (kills the autocrlf trap).
+* text=auto eol=lf
+
+# Windows scripts must stay CRLF (cmd.exe / PowerShell / wscript have LF edge cases).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
+
+# POSIX shell / git hooks stay LF regardless of platform.
+*.sh text eol=lf
+
+# sops-encrypted files travel as raw bytes — never convert (breaks the HMAC check).
+*.sops.env  -text
+*.sops.json -text
+*.sops.yaml -text
+release-secrets.sops.env -text
